@@ -2,6 +2,9 @@
 
 A Visual Studio Code extension that visualizes your Kibana codebase navigation as an interactive graph. Track file journeys, explore plugin dependencies, and map the complete plugin architecture.
 
+<img width="890" height="494" alt="Screen_Shot_2021-01-04_at_2 02 15_PM" src="https://github.com/user-attachments/assets/cbf3e17d-457b-4b9d-8de5-bf239bbd2ac4" />
+
+
 ## Features
 
 - **Three Viewing Modes**:
