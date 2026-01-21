@@ -1,0 +1,81 @@
+{
+  "name": "kibana-pathfinder",
+  "displayName": "Kibana Pathfinder",
+  "description": "Visualize your Kibana codebase navigation as an interactive graph - track file journeys, explore plugin dependencies, and map the complete plugin architecture",
+  "version": "0.0.1",
+  "publisher": "kibana-pathfinder",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Visualization",
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "pathfinder.openPanel",
+        "title": "Open Pathfinder Panel",
+        "category": "Pathfinder"
+      },
+      {
+        "command": "pathfinder.clearGraph",
+        "title": "Clear Navigation Graph",
+        "category": "Pathfinder"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "pathfinder",
+          "title": "Pathfinder",
+          "icon": "media/pathfinder-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "pathfinder": [
+        {
+          "type": "webview",
+          "id": "pathfinder.graphView",
+          "name": "Pathfinder Graph"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "webpack --mode production",
+    "watch": "webpack --mode development --watch",
+    "compile": "webpack --mode development",
+    "lint": "eslint src --ext ts,tsx"
+  },
+  "devDependencies": {
+    "@types/d3-force": "^3.0.10",
+    "@types/dagre": "^0.7.53",
+    "@types/node": "^20.10.0",
+    "@types/react": "^18.2.45",
+    "@types/react-dom": "^18.2.18",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^6.13.0",
+    "@typescript-eslint/parser": "^6.13.0",
+    "css-loader": "^6.8.1",
+    "eslint": "^8.55.0",
+    "style-loader": "^3.3.3",
+    "ts-loader": "^9.5.1",
+    "typescript": "^5.3.2",
+    "webpack": "^5.89.0",
+    "webpack-cli": "^5.1.4"
+  },
+  "dependencies": {
+    "@dagrejs/dagre": "^1.1.8",
+    "@xyflow/react": "^12.0.0",
+    "d3-force": "^3.0.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  }
+}

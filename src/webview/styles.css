@@ -1,0 +1,117 @@
+/* Kibana Pathfinder Styles */
+
+/* React Flow overrides to match VS Code theme */
+.react-flow__node {
+  font-family: var(--vscode-font-family);
+}
+
+.react-flow__controls {
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
+.react-flow__controls-button {
+  background: var(--vscode-button-secondaryBackground) !important;
+  border: 1px solid var(--vscode-panel-border) !important;
+  color: var(--vscode-button-secondaryForeground) !important;
+}
+
+.react-flow__controls-button:hover {
+  background: var(--vscode-button-secondaryHoverBackground) !important;
+}
+
+.react-flow__controls-button svg {
+  fill: var(--vscode-button-secondaryForeground) !important;
+}
+
+.react-flow__minimap {
+  background: var(--vscode-editor-background) !important;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+/* Navigation edges - blue and animated */
+.react-flow__edge:not(.dependency-edge) .react-flow__edge-path {
+  stroke: var(--vscode-charts-blue, #4fc3f7) !important;
+}
+
+.react-flow__edge.animated path {
+  stroke-dasharray: 5;
+  animation: dashdraw 0.5s linear infinite;
+}
+
+/* Dependency edges - solid dark grey */
+.react-flow__edge.dependency-edge .react-flow__edge-path {
+  stroke: #555555 !important;
+  stroke-dasharray: none !important;
+  opacity: 0.5 !important;
+  animation: none !important;
+}
+
+@keyframes dashdraw {
+  from {
+    stroke-dashoffset: 10;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+/* Custom scrollbar for VS Code theme */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--vscode-editor-background);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--vscode-scrollbarSlider-background);
+  border-radius: 5px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--vscode-scrollbarSlider-hoverBackground);
+}
+
+/* Tooltip animation */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+}
+
+/* Clear button hover effect */
+button:hover {
+  opacity: 0.9;
+}
+
+button:active {
+  transform: scale(0.98);
+}
+
+/* Empty state animation */
+@keyframes float {
+  0%, 100% {
+    transform: translate(-50%, -50%) translateY(0);
+  }
+  50% {
+    transform: translate(-50%, -50%) translateY(-10px);
+  }
+}
+
+/* Spinner animation for loading states */
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
