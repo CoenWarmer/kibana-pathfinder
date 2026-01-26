@@ -73,8 +73,13 @@
   },
   "dependencies": {
     "@dagrejs/dagre": "^1.1.8",
+    "@deck.gl/layers": "^9.2.6",
+    "@deck.gl/mesh-layers": "^9.2.6",
+    "@deck.gl/react": "^9.2.6",
+    "@luma.gl/core": "^9.2.6",
     "@xyflow/react": "^12.0.0",
     "d3-force": "^3.0.0",
+    "deck.gl": "^9.2.6",
     "react": "^18.2.0",
     "react-dom": "^18.2.0"
   }

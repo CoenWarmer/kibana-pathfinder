@@ -11,6 +11,7 @@ interface LocalPluginInfo {
   id: string; // Package ID like "@kbn/share-plugin"
   runtimeId: string; // Runtime ID like "share"
   requiredPlugins?: string[];
+  pluginDir: string; // Absolute path to the plugin directory
 }
 const localPluginInfoCache = new Map<string, LocalPluginInfo | undefined>();
 
@@ -20,15 +21,25 @@ export function clearPluginInfoCache() {
 }
 
 // Constants for layout
-const GROUP_PADDING = 20;
-const GROUP_HEADER_HEIGHT = 40;
-const NODE_WIDTH = 200;
+const GROUP_PADDING = 4; 
+const GROUP_HEADER_HEIGHT = 50;
+const NODE_WIDTH = 260;
 const NODE_HEIGHT = 80;
-const NODE_SPACING = 20;
+const NODE_SPACING = 4;
+
+// Symbol tracking info with line number
+interface TrackedSymbol {
+  name: string;
+  line: number;
+  filePath: string;
+}
 
 export class NavigationTracker implements vscode.Disposable {
   private _disposables: vscode.Disposable[] = [];
   private _previousFilePath: string | undefined;
+  private _lastTrackedSymbol: TrackedSymbol | undefined;
+  private _lastContainingSymbol: TrackedSymbol | undefined; // The function/class/type containing the cursor
+  private _lastSymbolTimestamp: number = 0;
 
   constructor(
     private readonly _viewProvider: PathfinderViewProvider,
@@ -48,10 +59,185 @@ export class NavigationTracker implements vscode.Disposable {
       })
     );
 
+    // Listen to selection changes to track the word under cursor
+    this._disposables.push(
+      vscode.window.onDidChangeTextEditorSelection((event) => {
+        this._onSelectionChange(event);
+      })
+    );
+
+    // Listen to tab close events (more reliable than onDidCloseTextDocument)
+    this._disposables.push(
+      vscode.window.tabGroups.onDidChangeTabs((event) => {
+        this._onTabsChange(event);
+      })
+    );
+
     // Initialize with current editor if any
     if (vscode.window.activeTextEditor) {
       this._onEditorChange(vscode.window.activeTextEditor);
     }
+  }
+
+  /**
+   * Handle tab changes - specifically when tabs are closed
+   */
+  private _onTabsChange(event: vscode.TabChangeEvent) {
+    // Handle closed tabs
+    for (const tab of event.closed) {
+      // Check if it's a text document tab
+      if (tab.input instanceof vscode.TabInputText) {
+        const filePath = tab.input.uri.fsPath;
+        const nodeId = this._generateNodeId(filePath);
+        
+        // Check if node exists in our state
+        const existingState = this._stateManager.getState();
+        const node = existingState?.nodes.find((n) => n.id === nodeId);
+        
+        if (node) {
+          const groupId = node.groupId;
+          
+          // Remove node from state and notify webview
+          this._stateManager.deleteNode(nodeId);
+          this._viewProvider.removeNode(nodeId);
+          
+          // Check if group needs resizing
+          if (groupId) {
+            // Always update group size - this will shrink it back to compact when empty
+            this._updateGroupSize(groupId);
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Track the word under cursor when selection changes.
+   * This helps us capture symbol names when user cmd+clicks to follow a reference.
+   */
+  private async _onSelectionChange(event: vscode.TextEditorSelectionChangeEvent) {
+    const editor = event.textEditor;
+    if (!editor || editor.document.uri.scheme !== 'file') {
+      return;
+    }
+
+    const selection = event.selections[0];
+    if (!selection || !selection.isEmpty) {
+      return; // Only track when cursor is at a position (not selecting text)
+    }
+
+    // Get the word at the cursor position (the symbol being clicked)
+    const wordRange = editor.document.getWordRangeAtPosition(selection.active);
+    if (wordRange) {
+      const word = editor.document.getText(wordRange);
+      // Only track words that look like identifiers (not numbers, keywords, etc.)
+      if (word && /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(word) && word.length > 1) {
+        this._lastTrackedSymbol = {
+          name: word,
+          line: selection.active.line + 1, // Convert to 1-based
+          filePath: editor.document.uri.fsPath,
+        };
+        this._lastSymbolTimestamp = Date.now();
+        
+        // Also find the containing function/class/type
+        this._lastContainingSymbol = await this._findContainingSymbol(
+          editor.document.uri,
+          selection.active
+        );
+      }
+    }
+  }
+
+  /**
+   * Find the function, class, or type that contains the given position.
+   */
+  private async _findContainingSymbol(
+    uri: vscode.Uri,
+    position: vscode.Position
+  ): Promise<TrackedSymbol | undefined> {
+    try {
+      // Get document symbols from VS Code
+      const symbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
+        'vscode.executeDocumentSymbolProvider',
+        uri
+      );
+
+      if (!symbols || symbols.length === 0) {
+        return undefined;
+      }
+
+      // Find the innermost symbol that contains the position
+      const containingSymbol = this._findInnermostContainingSymbol(symbols, position);
+      if (containingSymbol) {
+        return {
+          name: containingSymbol.name,
+          line: containingSymbol.selectionRange.start.line + 1, // Convert to 1-based
+          filePath: uri.fsPath,
+        };
+      }
+      return undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Find the most meaningful containing symbol for the position.
+   * Prioritizes top-level declarations (variables, functions, classes) over nested properties.
+   */
+  private _findInnermostContainingSymbol(
+    symbols: vscode.DocumentSymbol[],
+    position: vscode.Position
+  ): vscode.DocumentSymbol | undefined {
+    // Top-level declaration kinds - these are what we want to show as the "source"
+    // e.g., "export const processingDissectSuggestionRoute = ..." 
+    const topLevelKinds = new Set([
+      vscode.SymbolKind.Function,
+      vscode.SymbolKind.Method,
+      vscode.SymbolKind.Class,
+      vscode.SymbolKind.Interface,
+      vscode.SymbolKind.Variable,
+      vscode.SymbolKind.Constant,
+      vscode.SymbolKind.Enum,
+      vscode.SymbolKind.Constructor,
+    ]);
+
+    // Find all symbols that contain the position, tracking the path
+    const findContainingPath = (
+      syms: vscode.DocumentSymbol[],
+      path: vscode.DocumentSymbol[] = []
+    ): vscode.DocumentSymbol[] => {
+      for (const symbol of syms) {
+        if (symbol.range.contains(position)) {
+          const newPath = [...path, symbol];
+          if (symbol.children && symbol.children.length > 0) {
+            const deeperPath = findContainingPath(symbol.children, newPath);
+            if (deeperPath.length > newPath.length) {
+              return deeperPath;
+            }
+          }
+          return newPath;
+        }
+      }
+      return path;
+    };
+
+    const containingPath = findContainingPath(symbols);
+    
+    if (containingPath.length === 0) {
+      return undefined;
+    }
+
+    // Find the first (outermost) top-level declaration in the path
+    // This gives us "processingDissectSuggestionRoute" instead of "requiredPrivileges"
+    for (const symbol of containingPath) {
+      if (topLevelKinds.has(symbol.kind)) {
+        return symbol;
+      }
+    }
+
+    // Fallback: return the first symbol in the path
+    return containingPath[0];
   }
 
   private _onEditorChange(editor: vscode.TextEditor | undefined) {
@@ -74,19 +260,44 @@ export class NavigationTracker implements vscode.Disposable {
 
     // Check if this node already exists in state
     const existingState = this._stateManager.getState();
-    const nodeExists = existingState?.nodes.some((n) => n.id === nodeId);
+    const existingNode = existingState?.nodes.find((n) => n.id === nodeId);
+    const nodeExists = !!existingNode;
+
+    // Check if we have a recent symbol that was tracked (within 500ms)
+    // This indicates the user followed a reference (cmd+click)
+    const hasRecentSymbol = 
+      this._lastTrackedSymbol && 
+      this._previousFilePath && 
+      this._previousFilePath !== filePath &&
+      (Date.now() - this._lastSymbolTimestamp) < 500;
+    
+    const navigatedSymbol = hasRecentSymbol ? this._lastTrackedSymbol : undefined;
 
     if (!nodeExists) {
       // Get additional metadata
       const pluginInfo = this._findPluginInfo(filePath);
       const pluginName = pluginInfo?.id;
-      const relativePath = this._getRelativePath(filePath);
+      // Get path relative to plugin directory (not workspace root)
+      const relativePath = this._getRelativePath(filePath, pluginInfo?.pluginDir);
+
+      // Check if we're switching to a new plugin (group doesn't exist yet)
+      const groupId = pluginInfo?.runtimeId ? `group-${pluginInfo.runtimeId}` : undefined;
+      const existingGroup = groupId ? existingState.groups.find((g) => g.id === groupId) : undefined;
+      const isNewPlugin = groupId && (!existingGroup || existingGroup.type === 'dependency');
+      
+      console.log(`[Kibana Pathfinder] NavigationTracker: groupId=${groupId}, existingGroup=${!!existingGroup}, existingGroup.type=${existingGroup?.type}, isNewPlugin=${isNewPlugin}, pluginName=${pluginName}`);
+      
+      // Start tracking TypeScript loading for new plugins
+      if (isNewPlugin && pluginName) {
+        console.log(`[Kibana Pathfinder] NavigationTracker: Calling startTrackingTsLoading for ${pluginName}`);
+        this._viewProvider.startTrackingTsLoading(pluginName, filePath);
+      }
 
       // Create or get the group for this node (and required plugin groups)
-      const groupId = this._ensureGroup(pluginInfo, relativePath, existingState);
+      const finalGroupId = this._ensureGroup(pluginInfo, existingState);
 
       // Calculate position for new node within its group
-      const position = this._calculateNodePosition(existingState, groupId);
+      const position = this._calculateNodePosition(existingState, finalGroupId);
 
       const newNode: FileNode = {
         id: nodeId,
@@ -94,8 +305,9 @@ export class NavigationTracker implements vscode.Disposable {
         fileName,
         relativePath,
         pluginName,
-        groupId,
+        groupId: finalGroupId,
         position,
+        symbols: navigatedSymbol ? [navigatedSymbol] : undefined,
       };
 
       // Add node to state and notify webview
@@ -103,9 +315,39 @@ export class NavigationTracker implements vscode.Disposable {
       this._viewProvider.addNode(newNode);
 
       // Update group size to fit new node
-      if (groupId) {
-        this._updateGroupSize(groupId);
+      if (finalGroupId) {
+        this._updateGroupSize(finalGroupId);
       }
+    } else if (navigatedSymbol && existingNode) {
+      // Node exists, but we followed a new symbol to it - add the symbol
+      const existingSymbols = existingNode.symbols || [];
+      const symbolExists = existingSymbols.some(s => s.name === navigatedSymbol.name && s.line === navigatedSymbol.line);
+      if (!symbolExists) {
+        this._stateManager.addSymbolToNode(nodeId, navigatedSymbol);
+        this._viewProvider.addSymbolToNode(nodeId, navigatedSymbol);
+      }
+    }
+
+    // Add source symbol to the originating node (the function/class that contained the reference)
+    if (hasRecentSymbol && this._lastContainingSymbol && this._previousFilePath) {
+      const sourceNodeId = this._generateNodeId(this._previousFilePath);
+      const sourceNode = existingState?.nodes.find((n) => n.id === sourceNodeId);
+      if (sourceNode) {
+        const existingSourceSymbols = sourceNode.sourceSymbols || [];
+        const sourceSymbolExists = existingSourceSymbols.some(
+          s => s.name === this._lastContainingSymbol!.name && s.line === this._lastContainingSymbol!.line
+        );
+        if (!sourceSymbolExists) {
+          this._stateManager.addSourceSymbolToNode(sourceNodeId, this._lastContainingSymbol);
+          this._viewProvider.addSourceSymbolToNode(sourceNodeId, this._lastContainingSymbol);
+        }
+      }
+    }
+
+    // Clear the tracked symbols after using them
+    if (hasRecentSymbol) {
+      this._lastTrackedSymbol = undefined;
+      this._lastContainingSymbol = undefined;
     }
 
     // Create edge from previous file if exists and different
@@ -161,7 +403,7 @@ export class NavigationTracker implements vscode.Disposable {
       this._stateManager.deleteNode(nodeId);
       this._viewProvider.removeNode(nodeId);
 
-      // Check if group is now empty
+      // Check if group needs resizing or removal
       if (groupId) {
         const remainingNodesInGroup = this._stateManager.getNodesInGroup(groupId);
         if (remainingNodesInGroup.length === 0) {
@@ -212,6 +454,9 @@ export class NavigationTracker implements vscode.Disposable {
               }
             }
           }
+        } else {
+          // Group still has nodes, resize it to fit remaining nodes
+          this._updateGroupSize(groupId);
         }
       }
 
@@ -262,8 +507,15 @@ export class NavigationTracker implements vscode.Disposable {
     return `node-${Math.abs(hash).toString(16)}`;
   }
 
-  private _getRelativePath(filePath: string): string {
-    // Get path relative to workspace root
+  private _getRelativePath(filePath: string, pluginDir?: string): string {
+    // If we have a plugin directory, get path relative to it
+    if (pluginDir) {
+      const relativePath = path.relative(pluginDir, filePath);
+      // Return the directory path without the filename
+      return path.dirname(relativePath);
+    }
+    
+    // Fallback: Get path relative to workspace root
     const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
     if (workspaceFolder) {
       const relativePath = path.relative(workspaceFolder.uri.fsPath, filePath);
@@ -271,6 +523,15 @@ export class NavigationTracker implements vscode.Disposable {
       return path.dirname(relativePath);
     }
     return path.dirname(filePath);
+  }
+
+  private _getPluginPath(pluginDir: string): string {
+    // Get the plugin path relative to workspace root
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+    if (workspaceFolder) {
+      return path.relative(workspaceFolder.uri.fsPath, pluginDir);
+    }
+    return pluginDir;
   }
 
   private _findPluginInfo(filePath: string): LocalPluginInfo | undefined {
@@ -308,6 +569,7 @@ export class NavigationTracker implements vscode.Disposable {
             id: parsed.id, // Package ID like "@kbn/share-plugin"
             runtimeId, // Runtime ID like "share"
             requiredPlugins,
+            pluginDir: currentDir, // Store the plugin directory path
           };
 
           // Cache the result for this directory
@@ -332,7 +594,6 @@ export class NavigationTracker implements vscode.Disposable {
 
   private _ensureGroup(
     pluginInfo: LocalPluginInfo | undefined,
-    relativePath: string,
     existingState: { nodes: FileNode[]; edges: NavigationEdge[]; groups: GroupNode[] }
   ): string | undefined {
     if (!pluginInfo?.runtimeId) {
@@ -344,6 +605,7 @@ export class NavigationTracker implements vscode.Disposable {
     const displayName = pluginInfo.id; // Package ID for display
     const groupId = `group-${runtimeId}`;
     const existingGroup = existingState.groups.find((g) => g.id === groupId);
+    const pluginPath = this._getPluginPath(pluginInfo.pluginDir);
 
     // Check if a dependency group already exists that we need to convert
     if (existingGroup && existingGroup.type === 'dependency') {
@@ -357,6 +619,7 @@ export class NavigationTracker implements vscode.Disposable {
         width: mainGroupWidth,
         height: mainGroupHeight,
         requiredPlugins: pluginInfo.requiredPlugins || [],
+        pluginPath,
       };
 
       this._stateManager.updateGroup(upgradedGroup);
@@ -374,28 +637,26 @@ export class NavigationTracker implements vscode.Disposable {
       const requiredPlugins = pluginInfo.requiredPlugins || [];
       const currentState = this._stateManager.getState();
       
-      // Calculate main group position and size
-      const pluginGroupCount = currentState.groups.filter(g => g.type === 'plugin').length;
+      // Calculate main group size
       const mainGroupWidth = NODE_WIDTH + GROUP_PADDING * 2;
       const mainGroupHeight = GROUP_HEADER_HEIGHT + NODE_HEIGHT + GROUP_PADDING * 2;
       
-      // Dependency group dimensions
-      const DEP_WIDTH = 400;
-      const DEP_HEIGHT = 50;
-      const DEP_GAP = 5; // Minimum gap between dependency groups
+      // Simple vertical stacking: position new groups below existing ones
+      // Find the bottom of all existing plugin groups
+      const pluginGroups = currentState.groups.filter(g => g.type === 'plugin');
+      const GROUP_GAP = 40; // Gap between groups
+      const INITIAL_X = 50; // Starting X position
+      const INITIAL_Y = 50; // Starting Y position
       
-      // Calculate dynamic radius based on number of dependencies
-      const numDeps = requiredPlugins.length;
-      const minRadius = Math.max(200, (numDeps * (DEP_WIDTH + DEP_GAP)) / (2 * Math.PI));
-      const CIRCLE_RADIUS = minRadius + mainGroupWidth / 2 + 30;
+      let mainGroupX = INITIAL_X;
+      let mainGroupY = INITIAL_Y;
       
-      // Main group center position
-      const mainGroupCenterX = CIRCLE_RADIUS + DEP_WIDTH / 2 + 50;
-      const mainGroupCenterY = CIRCLE_RADIUS + DEP_HEIGHT / 2 + 50 + pluginGroupCount * (CIRCLE_RADIUS * 2 + 150);
-      
-      // Main group top-left position
-      const mainGroupX = mainGroupCenterX - mainGroupWidth / 2;
-      const mainGroupY = mainGroupCenterY - mainGroupHeight / 2;
+      if (pluginGroups.length > 0) {
+        // Position below the last plugin group
+        const lastGroup = pluginGroups[pluginGroups.length - 1];
+        mainGroupX = lastGroup.position.x; // Same X as last group
+        mainGroupY = lastGroup.position.y + lastGroup.height + GROUP_GAP;
+      }
       
       // Create the main plugin group first
       const newGroup: GroupNode = {
@@ -406,12 +667,13 @@ export class NavigationTracker implements vscode.Disposable {
         width: mainGroupWidth,
         height: mainGroupHeight,
         requiredPlugins,
+        pluginPath,
       };
 
       this._stateManager.addGroup(newGroup);
       this._viewProvider.addGroup(newGroup);
 
-      // Create dependency groups around it
+      // Create dependency groups around it (for Plugin mode)
       this._createDependencyGroups(requiredPlugins, { x: mainGroupX, y: mainGroupY }, groupId);
     }
 
@@ -427,36 +689,42 @@ export class NavigationTracker implements vscode.Disposable {
     const mainGroupWidth = NODE_WIDTH + GROUP_PADDING * 2;
     const mainGroupHeight = GROUP_HEADER_HEIGHT + NODE_HEIGHT + GROUP_PADDING * 2;
     
-    // Dependency group dimensions
-    const DEP_WIDTH = 100;
-    const DEP_HEIGHT = 50;
-    const DEP_GAP = 5;
+    // Dependency group dimensions for grid layout
+    const DEP_WIDTH = 200; // Width of compact dependency group
+    const DEP_HEIGHT = 50; // Height of compact dependency group
+    const GRID_GAP_X = 20; // Horizontal gap between dependencies
+    const GRID_GAP_Y = 15; // Vertical gap between rows
+    const GRID_COLUMNS = 5; // Number of columns in the grid
+    const GRID_TOP_MARGIN = 40; // Space between main group and dependency grid
     
-    // Calculate center of main group
-    const mainGroupCenterX = mainGroupPosition.x + mainGroupWidth / 2;
-    const mainGroupCenterY = mainGroupPosition.y + mainGroupHeight / 2;
-    
-    // Calculate dynamic radius
+    // Calculate the starting position for the grid (centered below main group)
     const numDeps = requiredPlugins.length;
-    const minRadius = Math.max(200, (numDeps * (DEP_WIDTH + DEP_GAP)) / (2 * Math.PI));
-    const CIRCLE_RADIUS = minRadius + mainGroupWidth / 2 + 30;
+    const numRows = Math.ceil(numDeps / GRID_COLUMNS);
+    const actualColumns = Math.min(numDeps, GRID_COLUMNS);
+    const gridWidth = actualColumns * DEP_WIDTH + (actualColumns - 1) * GRID_GAP_X;
+    
+    // Center the grid below the main group
+    const gridStartX = mainGroupPosition.x + (mainGroupWidth - gridWidth) / 2;
+    const gridStartY = mainGroupPosition.y + mainGroupHeight + GRID_TOP_MARGIN;
 
     requiredPlugins.forEach((depPluginId, index) => {
       const depGroupId = `group-${depPluginId}`;
       const depExists = currentState.groups.some((g) => g.id === depGroupId);
       
-      // Calculate angle for this dependency (used for positioning and handle selection)
-      const angle = -Math.PI / 2 + (2 * Math.PI * index) / numDeps;
+      // Calculate grid position
+      const row = Math.floor(index / GRID_COLUMNS);
+      const col = index % GRID_COLUMNS;
+      
+      // For the last row, center the items if it's not full
+      const itemsInThisRow = row === numRows - 1 ? numDeps - row * GRID_COLUMNS : GRID_COLUMNS;
+      const rowOffset = row === numRows - 1 
+        ? ((GRID_COLUMNS - itemsInThisRow) * (DEP_WIDTH + GRID_GAP_X)) / 2 
+        : 0;
+      
+      const depX = gridStartX + col * (DEP_WIDTH + GRID_GAP_X) + rowOffset;
+      const depY = gridStartY + row * (DEP_HEIGHT + GRID_GAP_Y);
       
       if (!depExists) {
-        // Calculate center position on the circle
-        const depCenterX = mainGroupCenterX + Math.cos(angle) * CIRCLE_RADIUS;
-        const depCenterY = mainGroupCenterY + Math.sin(angle) * CIRCLE_RADIUS;
-        
-        // Convert to top-left position
-        const depX = depCenterX - DEP_WIDTH / 2;
-        const depY = depCenterY - DEP_HEIGHT / 2;
-        
         // Get the display name (package ID) from the plugin cache
         const depDisplayName = pluginCache.getDisplayName(depPluginId);
         
@@ -473,22 +741,19 @@ export class NavigationTracker implements vscode.Disposable {
         this._viewProvider.addGroup(depGroup);
       }
 
-      // Create dependency edge with appropriate handles based on angle
+      // Create dependency edge
       const depEdgeId = `dep-${depGroupId}-${mainGroupId}`;
       const edgeExists = this._stateManager.getState().edges.some((e) => e.id === depEdgeId);
       
       if (!edgeExists) {
-        // Determine which handles to use based on the angle
-        // The dependency is positioned at 'angle' from the center of the main group
-        // We want the edge to connect on the facing sides
-        const { sourceHandle, targetHandle } = this._getHandlesForAngle(angle);
-        
+        // For grid layout, dependencies are below the main group
+        // So edges go from dependency's top to main group's bottom
         const depEdge: NavigationEdge = {
           id: depEdgeId,
           source: depGroupId,
           target: mainGroupId,
-          sourceHandle,
-          targetHandle,
+          sourceHandle: 'top-source',
+          targetHandle: 'bottom-target',
           edgeType: 'dependency',
         };
         
@@ -536,15 +801,27 @@ export class NavigationTracker implements vscode.Disposable {
 
     // Find all nodes in this group
     const nodesInGroup = state.nodes.filter((n) => n.groupId === groupId);
-    if (nodesInGroup.length === 0) return;
+    
+    // Calculate required dimensions based on number of nodes
+    let requiredHeight: number;
+    let requiredWidth: number;
+    
+    if (nodesInGroup.length === 0) {
+      // Empty group - use compact size (matches PathfinderGraph.tsx compact rendering)
+      requiredHeight = 50;
+      requiredWidth = 200;
+    } else {
+      // Has nodes - calculate based on node count
+      const nodeCount = nodesInGroup.length;
+      requiredHeight = GROUP_HEADER_HEIGHT + nodeCount * (NODE_HEIGHT + NODE_SPACING) + GROUP_PADDING;
+      requiredWidth = group.width; // Keep existing width
+    }
 
-    // Calculate required height
-    const requiredHeight =
-      GROUP_HEADER_HEIGHT + nodesInGroup.length * (NODE_HEIGHT + NODE_SPACING) + GROUP_PADDING;
-
-    if (requiredHeight > group.height) {
+    // Update if dimensions need to change
+    if (requiredHeight !== group.height || requiredWidth !== group.width) {
       const updatedGroup: GroupNode = {
         ...group,
+        width: requiredWidth,
         height: requiredHeight,
       };
       this._stateManager.updateGroup(updatedGroup);
@@ -580,6 +857,50 @@ export class NavigationTracker implements vscode.Disposable {
       x: 20,
       y: maxGroupBottom + 20 + nodeIndex * (NODE_HEIGHT + NODE_SPACING),
     };
+  }
+
+  /**
+   * Handle view mode changes from the webview.
+   * Creates or removes dependency groups based on the new mode.
+   */
+  public handleModeChange(newMode: string) {
+    console.log(`[Kibana Pathfinder] NavigationTracker.handleModeChange: ${newMode}`);
+    const currentState = this._stateManager.getState();
+    
+    if (newMode === 'plugin') {
+      // Plugin mode: ensure dependency groups exist for all plugin groups
+      const pluginGroups = currentState.groups.filter(g => g.type === 'plugin');
+      
+      for (const pluginGroup of pluginGroups) {
+        const requiredPlugins = pluginGroup.requiredPlugins || [];
+        if (requiredPlugins.length > 0) {
+          // Check which dependency groups are missing
+          const existingGroupIds = new Set(currentState.groups.map(g => g.id));
+          const missingDeps = requiredPlugins.filter(dep => !existingGroupIds.has(`group-${dep}`));
+          
+          if (missingDeps.length > 0) {
+            console.log(`[Kibana Pathfinder] Creating ${missingDeps.length} missing dependency groups for ${pluginGroup.label}`);
+            this._createDependencyGroups(missingDeps, pluginGroup.position, pluginGroup.id);
+          }
+        }
+      }
+    } else if (newMode === 'journey') {
+      // Journey mode: remove empty dependency groups
+      // Note: Edges are automatically filtered out in the webview based on valid endpoints
+      const emptyDependencyGroups = currentState.groups.filter(g => {
+        if (g.type !== 'dependency') return false;
+        // Check if this group has any file nodes
+        const nodesInGroup = currentState.nodes.filter(n => n.groupId === g.id);
+        return nodesInGroup.length === 0;
+      });
+      
+      console.log(`[Kibana Pathfinder] Removing ${emptyDependencyGroups.length} empty dependency groups for Journey mode`);
+      
+      for (const group of emptyDependencyGroups) {
+        this._stateManager.deleteGroup(group.id);
+        this._viewProvider.removeGroup(group.id);
+      }
+    }
   }
 
   public dispose() {

@@ -24,9 +24,10 @@ import {
   SimulationNodeDatum,
   SimulationLinkDatum,
 } from 'd3-force';
-import { FileNode as FileNodeType, NavigationEdge, GroupNode as GroupNodeType, FileSearchResult, ViewMode, PluginInfoForWebview } from '../../types';
+import { FileNode as FileNodeType, NavigationEdge, GroupNode as GroupNodeType, FileSearchResult, ViewMode, PluginInfoForWebview, ImportedExport } from '../../types';
 import { FileNode } from './FileNode';
 import { GroupNode } from './GroupNode';
+import { resolveCollisions } from '../utils/resolveCollisions';
 
 // Calculate optimal handles based on relative node positions
 function calculateHandles(
@@ -204,6 +205,10 @@ interface PathfinderGraphProps {
   searchResults: { [pluginId: string]: FileSearchResult[] };
   viewMode: ViewMode;
   allPlugins: PluginInfoForWebview[];
+  importAnalysis: { [dependencyPluginId: string]: ImportedExport[] };
+  analyzingImports: string | null;
+  openImportAnalysisPopup: string | null;
+  loadingPlugins: Set<string>;
   onNodeClick: (filePath: string) => void;
   onNodeDelete: (nodeId: string, filePath: string) => void;
   onClear: () => void;
@@ -212,6 +217,9 @@ interface PathfinderGraphProps {
   onSearchFiles: (pluginId: string, query: string) => void;
   onOpenPluginIndex: (pluginId: string) => void;
   onModeChange: (mode: ViewMode) => void;
+  onAnalyzeImports: (mainPluginId: string, dependencyPluginId: string) => void;
+  onToggleImportAnalysis: (dependencyLabel: string | null) => void;
+  onOpenImportSource: (importPath: string, symbolName: string) => void;
 }
 
 // Custom node types
@@ -230,6 +238,9 @@ export function PathfinderGraph({
   searchResults,
   viewMode,
   allPlugins,
+  importAnalysis,
+  analyzingImports,
+  loadingPlugins,
   onNodeClick,
   onNodeDelete,
   onClear,
@@ -238,6 +249,10 @@ export function PathfinderGraph({
   onSearchFiles,
   onOpenPluginIndex,
   onModeChange,
+  onAnalyzeImports,
+  openImportAnalysisPopup,
+  onToggleImportAnalysis,
+  onOpenImportSource,
 }: PathfinderGraphProps) {
   // Ref to store the React Flow instance for viewport manipulation
   const reactFlowInstance = useRef<ReactFlowInstance | null>(null);
@@ -327,6 +342,9 @@ export function PathfinderGraph({
   const [isSearchDropdownOpen, setIsSearchDropdownOpen] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
   
+  // Track which group has an active file search (for z-index boosting)
+  const [activeSearchGroup, setActiveSearchGroup] = useState<string | null>(null);
+  
   // Track whether we've already calculated the layout for the current complete mode session
   const hasCalculatedLayoutRef = useRef(false);
 
@@ -357,8 +375,8 @@ export function PathfinderGraph({
     // Use setTimeout to allow the UI to update before heavy calculation
     const timeoutId = setTimeout(() => {
       // Layout constants for complete mode
-      const GROUP_WIDTH = 180;
-      const GROUP_HEIGHT = 50;
+      const GROUP_WIDTH = 240;
+      const GROUP_HEIGHT = 40;
 
       // Layout ALL plugins (not just those not in inputGroups)
       // This ensures consistent positioning regardless of which files are open
@@ -405,7 +423,7 @@ export function PathfinderGraph({
       setCompleteGroups(groups);
       setIsCalculatingLayout(false);
       hasCalculatedLayoutRef.current = true;
-    }, 50);
+    }, 150);
 
     return () => clearTimeout(timeoutId);
   }, [viewMode, allPlugins, completeEdges, inputGroups]);
@@ -423,7 +441,7 @@ export function PathfinderGraph({
 
   // Filtered plugin search results
   const filteredPluginResults = useMemo(() => {
-    if (!pluginSearchQuery.trim() || viewMode !== 'complete') {
+    if (!pluginSearchQuery.trim()) {
       return [];
     }
     const query = pluginSearchQuery.toLowerCase();
@@ -433,23 +451,35 @@ export function PathfinderGraph({
         plugin.runtimeId.toLowerCase().includes(query)
       )
       .slice(0, 10); // Limit to 10 results
-  }, [pluginSearchQuery, allPlugins, viewMode]);
+  }, [pluginSearchQuery, allPlugins]);
 
   // Handle plugin selection from search
   const handlePluginSearchSelect = useCallback((plugin: PluginInfoForWebview) => {
     const groupId = `group-${plugin.runtimeId}`;
-    const position = completePositionsRef.current.get(groupId);
     
     // Clear search immediately
     setPluginSearchQuery('');
     setIsSearchDropdownOpen(false);
     
+    // Try to find position - first from complete mode cache, then from input groups
+    let position = completePositionsRef.current.get(groupId);
+    let groupWidth = 180;
+    let groupHeight = 50;
+    
+    if (!position) {
+      // Look in input groups (for Journey/Plugin modes)
+      const group = inputGroups.find((g) => g.id === groupId);
+      if (group) {
+        position = group.position;
+        groupWidth = group.width;
+        groupHeight = group.height;
+      }
+    }
+    
     if (position && reactFlowInstance.current) {
       // Zoom to the plugin node first
-      const GROUP_WIDTH = 180;
-      const GROUP_HEIGHT = 50;
-      const centerX = position.x + GROUP_WIDTH / 2;
-      const centerY = position.y + GROUP_HEIGHT / 2;
+      const centerX = position.x + groupWidth / 2;
+      const centerY = position.y + groupHeight / 2;
       
       reactFlowInstance.current.setCenter(centerX, centerY, { zoom: 1.5, duration: 500 });
       
@@ -461,7 +491,7 @@ export function PathfinderGraph({
       // No position found, just open the file
       onOpenPluginIndex(plugin.packageId);
     }
-  }, [onOpenPluginIndex]);
+  }, [onOpenPluginIndex, inputGroups]);
 
   // Handle keyboard navigation in search
   const [selectedSearchIndex, setSelectedSearchIndex] = useState(0);
@@ -534,6 +564,21 @@ export function PathfinderGraph({
         const width = isDependency && isEmpty ? 200 : group.width;
         const height = isDependency && isEmpty ? 50 : group.height;
         
+        // For dependency groups, find the parent plugin that requires this dependency
+        // Extract runtime ID from group ID (format: "group-{runtimeId}")
+        const groupRuntimeId = group.id.replace('group-', '');
+        let parentPluginId: string | undefined;
+        
+        if (isDependency && viewMode === 'plugin') {
+          // Find the plugin group that has this as a required plugin
+          const parentGroup = filteredGroups.find(
+            (g) => g.type === 'plugin' && g.requiredPlugins?.includes(groupRuntimeId)
+          );
+          if (parentGroup) {
+            parentPluginId = parentGroup.id.replace('group-', '');
+          }
+        }
+        
         return {
           id: group.id,
           type: 'groupNode',
@@ -547,37 +592,64 @@ export function PathfinderGraph({
             onFileSelect: onNodeClick,
             onOpenPluginIndex: onOpenPluginIndex,
             isCompleteMode: viewMode === 'complete',
+            pluginPath: group.pluginPath,
+            isLoading: loadingPlugins.has(group.label),
+            // Import analysis props (for dependency groups in plugin mode)
+            parentPluginId,
+            onAnalyzeImports: isDependency ? onAnalyzeImports : undefined,
+            importAnalysis: importAnalysis[group.label],
+            isAnalyzingImports: analyzingImports === group.label,
+            showImportAnalysis: openImportAnalysisPopup === group.label,
+            onToggleImportAnalysis: isDependency ? onToggleImportAnalysis : undefined,
+            onOpenImportSource: isDependency ? onOpenImportSource : undefined,
+            // File search z-index boosting
+            onSearchActiveChange: (isActive: boolean) => setActiveSearchGroup(isActive ? group.label : null),
           },
           style: {
             width,
             height,
+            // Groups with file nodes should have higher z-index so their children aren't occluded
+            // Active search gets highest (5000), popup open next (2000), groups with nodes next (100), empty groups lowest (1)
+            zIndex: activeSearchGroup === group.label ? 5000 : openImportAnalysisPopup === group.label ? 2000 : nodesInGroup.length > 0 ? 100 : 1,
           },
         };
       }),
-    [filteredGroups, inputNodes, searchResults, onSearchFiles, onNodeClick, onOpenPluginIndex, viewMode]
+    [filteredGroups, inputNodes, searchResults, onSearchFiles, onNodeClick, onOpenPluginIndex, viewMode, onAnalyzeImports, importAnalysis, analyzingImports, openImportAnalysisPopup, onToggleImportAnalysis, onOpenImportSource, loadingPlugins, activeSearchGroup]
   );
 
   // Convert file nodes to React Flow nodes
   const fileFlowNodes: Node[] = useMemo(
     () =>
-      inputNodes.map((node) => ({
-        id: node.id,
-        type: 'fileNode',
-        position: node.position,
-        parentId: node.groupId,
-        extent: node.groupId ? 'parent' as const : undefined,
-        data: {
-          label: node.fileName,
-          filePath: node.filePath,
-          relativePath: node.relativePath,
-          pluginName: node.pluginName,
-          isHighlighted: node.id === highlightedNodeId,
-          isActive: node.id === activeNodeId,
-          onDelete: () => onNodeDelete(node.id, node.filePath),
-          onClick: () => onNodeClick(node.filePath),
-        },
-      })),
-    [inputNodes, highlightedNodeId, activeNodeId, onNodeClick, onNodeDelete]
+      inputNodes.map((node) => {
+        // Calculate width based on parent group (100% width, no padding)
+        const parentGroup = filteredGroups.find((g) => g.id === node.groupId);
+        const nodeWidth = parentGroup ? parentGroup.width : 260; // Full width of group
+        
+        return {
+          id: node.id,
+          type: 'fileNode',
+          position: node.position,
+          parentId: node.groupId,
+          extent: node.groupId ? 'parent' as const : undefined,
+          style: {
+            width: nodeWidth,
+            zIndex: 1000, // Ensure file nodes appear above group nodes
+          },
+          data: {
+            label: node.fileName,
+            filePath: node.filePath,
+            relativePath: node.relativePath,
+            pluginName: node.pluginName,
+            symbols: node.symbols,
+            sourceSymbols: node.sourceSymbols,
+            isHighlighted: node.id === highlightedNodeId,
+            isActive: node.id === activeNodeId,
+            onDelete: () => onNodeDelete(node.id, node.filePath),
+            onClick: () => onNodeClick(node.filePath),
+          },
+        };
+      }),
+    [inputNodes, filteredGroups, highlightedNodeId, activeNodeId, onNodeClick, onNodeDelete]
   );
 
   // Combine group and file nodes (groups must come first)
@@ -694,13 +766,48 @@ export function PathfinderGraph({
         }
         
         // Navigation edges: animated, blue
+        // Calculate handles dynamically based on file node positions
+        let sourceHandle = edge.sourceHandle;
+        let targetHandle = edge.targetHandle;
+        
+        // Find source and target file nodes to calculate closest handles
+        const sourceNode = inputNodes.find((n) => n.id === edge.source);
+        const targetNode = inputNodes.find((n) => n.id === edge.target);
+        
+        if (sourceNode && targetNode) {
+          // Get absolute positions (group position + node's relative position)
+          const sourceGroup = filteredGroups.find((g) => g.id === sourceNode.groupId);
+          const targetGroup = filteredGroups.find((g) => g.id === targetNode.groupId);
+          
+          const sourceAbsX = (sourceGroup?.position.x || 0) + sourceNode.position.x;
+          const sourceAbsY = (sourceGroup?.position.y || 0) + sourceNode.position.y;
+          const targetAbsX = (targetGroup?.position.x || 0) + targetNode.position.x;
+          const targetAbsY = (targetGroup?.position.y || 0) + targetNode.position.y;
+          
+          // Estimate file node dimensions
+          const nodeWidth = sourceGroup ? sourceGroup.width - 30 : 230;
+          const nodeHeight = 80;
+          
+          const handles = calculateHandles(
+            { x: sourceAbsX, y: sourceAbsY },
+            nodeWidth,
+            nodeHeight,
+            { x: targetAbsX, y: targetAbsY },
+            nodeWidth,
+            nodeHeight
+          );
+          sourceHandle = handles.sourceHandle;
+          targetHandle = handles.targetHandle;
+        }
+        
         return {
           id: edge.id,
           source: edge.source,
           target: edge.target,
-          sourceHandle: edge.sourceHandle,
-          targetHandle: edge.targetHandle,
+          sourceHandle,
+          targetHandle,
           animated: true,
+          zIndex: 1001, // Above file nodes (1000) and group nodes (100)
           style: { stroke: 'var(--vscode-charts-blue, #4fc3f7)', strokeWidth: 2 },
           markerEnd: {
             type: MarkerType.ArrowClosed,
@@ -708,16 +815,94 @@ export function PathfinderGraph({
           },
         };
       }),
-    [filteredEdges, filteredGroups, viewMode]
+    [filteredEdges, filteredGroups, viewMode, inputNodes]
   );
 
   const [nodes, setNodes, onNodesChange] = useNodesState(flowNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(flowEdges);
 
-  // Sync external nodes/edges with internal state
+  // Track previous state to detect meaningful changes for collision resolution
+  const prevCollisionStateRef = useRef<string>('');
+  const collisionTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Create a fingerprint of group dimensions to detect size changes
+  const groupDimensionsFingerprint = useMemo(() => {
+    return inputGroups.map(g => `${g.id}:${g.width}x${g.height}`).join(',');
+  }, [inputGroups]);
+
+  // Create a fingerprint of file node distribution across groups
+  const fileNodeDistributionFingerprint = useMemo(() => {
+    // Track which groups have how many file nodes - this ensures collision detection
+    // runs when a file node is added to any group
+    const distribution: Record<string, number> = {};
+    inputNodes.forEach(n => {
+      if (n.groupId) {
+        distribution[n.groupId] = (distribution[n.groupId] || 0) + 1;
+      }
+    });
+    return Object.entries(distribution).map(([id, count]) => `${id}:${count}`).sort().join(',');
+  }, [inputNodes]);
+
+  // Sync external nodes/edges with internal state and resolve collisions
   React.useEffect(() => {
-    setNodes(flowNodes);
-  }, [flowNodes, setNodes]);
+    // Create a fingerprint that captures meaningful structural changes (count + dimensions + file distribution)
+    const currentFingerprint = `${inputNodes.length}-${inputGroups.length}-${groupDimensionsFingerprint}-${fileNodeDistributionFingerprint}`;
+    const structuralChange = currentFingerprint !== prevCollisionStateRef.current;
+    
+    if (structuralChange) {
+      // Structural change: sync all nodes and run collision resolution
+      setNodes(flowNodes);
+      prevCollisionStateRef.current = currentFingerprint;
+      
+      // Clear any pending collision resolution
+      if (collisionTimeoutRef.current) {
+        clearTimeout(collisionTimeoutRef.current);
+        collisionTimeoutRef.current = null;
+      }
+      
+      // Resolve collisions after nodes are set (with a small delay for measurements)
+      collisionTimeoutRef.current = setTimeout(() => {
+        setNodes((currentNodes) =>
+          resolveCollisions(currentNodes, {
+            maxIterations: 50,
+            overlapThreshold: 0.5,
+            margin: 15,
+          })
+        );
+        collisionTimeoutRef.current = null;
+      }, 100);
+    } else {
+      // Non-structural change (data only): update node data while preserving positions
+      setNodes((currentNodes) => {
+        const flowNodeMap = new Map(flowNodes.map(n => [n.id, n]));
+        return currentNodes.map(currentNode => {
+          const flowNode = flowNodeMap.get(currentNode.id);
+          if (flowNode) {
+            // Keep current position, update data and other properties
+            return {
+              ...flowNode,
+              position: currentNode.position, // Preserve user-dragged/collision-resolved position
+            };
+          }
+          return currentNode;
+        });
+      });
+    }
+    
+    // Note: We intentionally do NOT clear the timeout in cleanup here.
+    // The timeout should only be cleared when a NEW structural change starts
+    // (which is done at the beginning of the if(structuralChange) block).
+    // Clearing in cleanup would cancel pending collision resolution on every re-render.
+  }, [flowNodes, setNodes, inputNodes.length, inputGroups.length, groupDimensionsFingerprint, fileNodeDistributionFingerprint]);
+
+  // Cleanup timeout on unmount only
+  React.useEffect(() => {
+    return () => {
+      if (collisionTimeoutRef.current) {
+        clearTimeout(collisionTimeoutRef.current);
+      }
+    };
+  }, []);
 
   React.useEffect(() => {
     setEdges(flowEdges);
@@ -757,6 +942,20 @@ export function PathfinderGraph({
     [onNodesChange, inputNodes, inputEdges, inputGroups, nodes, onStateChange, onGroupsChange]
   );
 
+  // Handle node drag stop - resolve collisions after manual drag
+  const handleNodeDragStop = useCallback(
+    () => {
+      setNodes((currentNodes) =>
+        resolveCollisions(currentNodes, {
+          maxIterations: 50,
+          overlapThreshold: 0.5,
+          margin: 15,
+        })
+      );
+    },
+    [setNodes]
+  );
+
   const handleEdgesChange = useCallback(
     (changes: EdgeChange[]) => {
       onEdgesChange(changes);
@@ -764,7 +963,7 @@ export function PathfinderGraph({
     [onEdgesChange]
   );
 
-  const modes: ViewMode[] = ['journey', 'plugin', 'complete'];
+  const modes: ViewMode[] = ['journey', 'plugin', 'complete', '3d'];
 
   return (
     <div style={{ width: '100%', height: '100%', position: 'relative' }}>
@@ -780,36 +979,35 @@ export function PathfinderGraph({
           alignItems: 'center',
         }}
       >
-        {/* Plugin search (Complete mode only) */}
-        {viewMode === 'complete' && (
-          <div style={{ position: 'relative' }}>
-            <input
-              ref={searchInputRef}
-              type="text"
-              value={pluginSearchQuery}
-              onChange={(e) => {
-                setPluginSearchQuery(e.target.value);
-                setIsSearchDropdownOpen(true);
-              }}
-              onFocus={() => setIsSearchDropdownOpen(true)}
-              onBlur={() => {
-                // Delay to allow click on dropdown item
-                setTimeout(() => setIsSearchDropdownOpen(false), 200);
-              }}
-              onKeyDown={handleSearchKeyDown}
-              placeholder="Search plugins..."
-              style={{
-                padding: '6px 10px',
-                width: '200px',
-                background: 'var(--vscode-input-background)',
-                color: 'var(--vscode-input-foreground)',
-                border: '1px solid var(--vscode-input-border, var(--vscode-panel-border))',
-                borderRadius: '4px',
-                fontSize: '12px',
-                fontFamily: 'var(--vscode-font-family)',
-                outline: 'none',
-              }}
-            />
+        {/* Plugin search */}
+        <div style={{ position: 'relative' }}>
+          <input
+            ref={searchInputRef}
+            type="text"
+            value={pluginSearchQuery}
+            onChange={(e) => {
+              setPluginSearchQuery(e.target.value);
+              setIsSearchDropdownOpen(true);
+            }}
+            onFocus={() => setIsSearchDropdownOpen(true)}
+            onBlur={() => {
+              // Delay to allow click on dropdown item
+              setTimeout(() => setIsSearchDropdownOpen(false), 200);
+            }}
+            onKeyDown={handleSearchKeyDown}
+            placeholder="Search plugins..."
+            style={{
+              padding: '6px 10px',
+              width: '200px',
+              background: 'var(--vscode-input-background)',
+              color: 'var(--vscode-input-foreground)',
+              border: '1px solid var(--vscode-input-border, var(--vscode-panel-border))',
+              borderRadius: '4px',
+              fontSize: '12px',
+              fontFamily: 'var(--vscode-font-family)',
+              outline: 'none',
+            }}
+          />
             {/* Search dropdown */}
             {isSearchDropdownOpen && filteredPluginResults.length > 0 && (
               <div
@@ -862,7 +1060,6 @@ export function PathfinderGraph({
               </div>
             )}
           </div>
-        )}
 
         {/* Mode toggle */}
         <div
@@ -947,6 +1144,8 @@ export function PathfinderGraph({
         edges={edges}
         onNodesChange={handleNodesChange}
         onEdgesChange={handleEdgesChange}
+        onNodeDragStop={handleNodeDragStop}
+        elevateNodesOnSelect={false}
         onInit={(instance) => {
           reactFlowInstance.current = instance;
         }}

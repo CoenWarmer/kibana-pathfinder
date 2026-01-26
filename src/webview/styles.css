@@ -5,6 +5,16 @@
   font-family: var(--vscode-font-family);
 }
 
+/* Smooth transitions for collision resolution repositioning - only on group nodes */
+.react-flow__node-groupNode {
+  transition: transform 0.3s ease-out;
+}
+
+/* Disable transition during active drag to keep it responsive */
+.react-flow__node-groupNode.dragging {
+  transition: none;
+}
+
 .react-flow__controls {
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
 }
@@ -41,9 +51,8 @@
 
 /* Dependency edges - solid dark grey */
 .react-flow__edge.dependency-edge .react-flow__edge-path {
-  stroke: #555555 !important;
+  stroke: #605a5a5e !important;
   stroke-dasharray: none !important;
-  opacity: 0.5 !important;
   animation: none !important;
 }
 

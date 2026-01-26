@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { FileNode, NavigationEdge, GraphState, GroupNode } from './types';
+import { FileNode, NavigationEdge, GraphState, GroupNode, SymbolInfo } from './types';
 
 const STATE_KEY = 'pathfinder.graphState';
 
@@ -66,6 +66,34 @@ export class StateManager {
     if (node) {
       node.position = position;
       this._persistState();
+    }
+  }
+
+  public addSymbolToNode(nodeId: string, symbol: SymbolInfo) {
+    const node = this._state.nodes.find((n) => n.id === nodeId);
+    if (node) {
+      if (!node.symbols) {
+        node.symbols = [];
+      }
+      const exists = node.symbols.some(s => s.name === symbol.name && s.line === symbol.line);
+      if (!exists) {
+        node.symbols.push(symbol);
+        this._persistState();
+      }
+    }
+  }
+
+  public addSourceSymbolToNode(nodeId: string, symbol: SymbolInfo) {
+    const node = this._state.nodes.find((n) => n.id === nodeId);
+    if (node) {
+      if (!node.sourceSymbols) {
+        node.sourceSymbols = [];
+      }
+      const exists = node.sourceSymbols.some(s => s.name === symbol.name && s.line === symbol.line);
+      if (!exists) {
+        node.sourceSymbols.push(symbol);
+        this._persistState();
+      }
     }
   }
 

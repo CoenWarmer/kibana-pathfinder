@@ -36,6 +36,9 @@ export async function activate(context: vscode.ExtensionContext) {
   // Initialize navigation tracker
   navigationTracker = new NavigationTracker(provider, stateManager);
   context.subscriptions.push(navigationTracker);
+  
+  // Connect view provider to navigation tracker for mode change handling
+  provider.setNavigationTracker(navigationTracker);
 
   // Register commands
   context.subscriptions.push(

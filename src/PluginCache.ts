@@ -50,21 +50,30 @@ class PluginCacheManager {
           const pluginDir = path.dirname(file.fsPath);
           const requiredPlugins = parsed.plugin?.requiredPlugins || parsed.requiredPlugins || [];
 
-          if (runtimeId) {
+          // Handle both plugins (with plugin.id) and packages (without plugin.id)
+          if (runtimeId || packageId) {
+            // For packages without a runtime ID, use the package ID as the runtime ID
+            // This avoids collisions with actual plugin runtime IDs
+            const effectiveRuntimeId = runtimeId || packageId;
+            
             const info: PluginInfo = {
-              runtimeId,
+              runtimeId: effectiveRuntimeId,
               packageId,
               directory: pluginDir,
               requiredPlugins,
             };
 
-            // Store by runtime ID (exact and lowercase)
-            this._cache.set(runtimeId, info);
-            this._cache.set(runtimeId.toLowerCase(), info);
+            // Store by runtime ID (exact and lowercase) - but only if it's a real plugin ID
+            // to avoid packages overwriting plugins
+            if (runtimeId) {
+              this._cache.set(runtimeId, info);
+              this._cache.set(runtimeId.toLowerCase(), info);
+            }
 
-            // Also store by package ID for reverse lookups
+            // Always store by package ID for lookups
             if (packageId) {
               this._cache.set(packageId, info);
+              this._cache.set(packageId.toLowerCase(), info);
             }
           }
         } catch {

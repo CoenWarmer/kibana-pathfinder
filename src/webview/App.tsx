@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { PathfinderGraph } from './components/PathfinderGraph';
+import { PathfinderGraph3D } from './components/PathfinderGraph3D';
 import {
   FileNode,
   NavigationEdge,
@@ -9,10 +10,11 @@ import {
   FileSearchResult,
   ViewMode,
   PluginInfoForWebview,
+  ImportedExport,
 } from '../types';
 
-// Acquire VS Code API
-const vscode = acquireVsCodeApi();
+// Import shared VS Code API instance
+import { vscode } from './vscodeApi';
 
 function App() {
   const [nodes, setNodes] = useState<FileNode[]>([]);
@@ -23,6 +25,10 @@ function App() {
   const [searchResults, setSearchResults] = useState<{ [pluginId: string]: FileSearchResult[] }>({});
   const [viewMode, setViewMode] = useState<ViewMode>('journey');
   const [allPlugins, setAllPlugins] = useState<PluginInfoForWebview[]>([]);
+  const [importAnalysis, setImportAnalysis] = useState<{ [dependencyPluginId: string]: ImportedExport[] }>({});
+  const [analyzingImports, setAnalyzingImports] = useState<string | null>(null);
+  const [openImportAnalysisPopup, setOpenImportAnalysisPopup] = useState<string | null>(null);
+  const [loadingPlugins, setLoadingPlugins] = useState<Set<string>>(new Set());
 
   // Send message to extension
   const postMessage = useCallback((message: WebviewToExtensionMessage) => {
@@ -82,7 +88,8 @@ function App() {
           setEdges(message.state.edges);
           setGroups(message.state.groups || []);
           if (message.state.viewMode) {
-            setViewMode(message.state.viewMode);
+            // Don't restore '3d' mode - it's experimental and slow
+            setViewMode(message.state.viewMode === '3d' ? 'journey' : message.state.viewMode);
           }
           break;
 
@@ -102,6 +109,41 @@ function App() {
           );
           break;
 
+        case 'addSymbolToNode':
+          setNodes((prev) =>
+            prev.map((n) => {
+              // Match by filePath since nodeId uses a hash
+              if (n.filePath === message.nodeId || n.id === message.nodeId) {
+                const existingSymbols = n.symbols || [];
+                const exists = existingSymbols.some(
+                  (s) => s.name === message.symbol.name && s.line === message.symbol.line
+                );
+                if (!exists) {
+                  return { ...n, symbols: [...existingSymbols, message.symbol] };
+                }
+              }
+              return n;
+            })
+          );
+          break;
+
+        case 'addSourceSymbolToNode':
+          setNodes((prev) =>
+            prev.map((n) => {
+              if (n.id === message.nodeId) {
+                const existingSourceSymbols = n.sourceSymbols || [];
+                const exists = existingSourceSymbols.some(
+                  (s) => s.name === message.symbol.name && s.line === message.symbol.line
+                );
+                if (!exists) {
+                  return { ...n, sourceSymbols: [...existingSourceSymbols, message.symbol] };
+                }
+              }
+              return n;
+            })
+          );
+          break;
+
         case 'removeGroup':
           setGroups((prev) => prev.filter((g) => g.id !== message.groupId));
           break;
@@ -117,11 +159,33 @@ function App() {
           setAllPlugins(message.plugins);
           break;
 
+        case 'importAnalysis':
+          setImportAnalysis((prev) => ({
+            ...prev,
+            [message.dependencyPluginId]: message.imports,
+          }));
+          setAnalyzingImports(null);
+          break;
+
+        case 'tsLoading':
+          setLoadingPlugins((prev) => {
+            const next = new Set(prev);
+            if (message.isLoading) {
+              next.add(message.pluginId);
+            } else {
+              next.delete(message.pluginId);
+            }
+            return next;
+          });
+          break;
+
         case 'clear':
           setNodes([]);
           setEdges([]);
           setGroups([]);
           setSearchResults({});
+          setImportAnalysis({});
+          setLoadingPlugins(new Set());
           break;
       }
     };
@@ -154,6 +218,23 @@ function App() {
     [postMessage]
   );
 
+  const handleAnalyzeImports = useCallback(
+    (mainPluginId: string, dependencyPluginId: string) => {
+      setAnalyzingImports(dependencyPluginId);
+      postMessage({ type: 'analyzeImports', mainPluginId, dependencyPluginId });
+    },
+    [postMessage]
+  );
+
+  const handleOpenImportSource = useCallback(
+    (importPath: string, symbolName: string) => {
+      // Close the popup when opening a file from it
+      setOpenImportAnalysisPopup(null);
+      postMessage({ type: 'openImportSource', importPath, symbolName });
+    },
+    [postMessage]
+  );
+
   const handleClear = useCallback(() => {
     setNodes([]);
     setEdges([]);
@@ -176,11 +257,14 @@ function App() {
     [postMessage]
   );
 
+  // Helper to get persistable view mode (don't persist '3d' mode - it's experimental)
+  const getPersistableViewMode = (mode: ViewMode): ViewMode => (mode === '3d' ? 'journey' : mode);
+
   const handleStateChange = useCallback(
     (newNodes: FileNode[], newEdges: NavigationEdge[]) => {
       setNodes(newNodes);
       setEdges(newEdges);
-      postMessage({ type: 'saveState', state: { nodes: newNodes, edges: newEdges, groups, viewMode } });
+      postMessage({ type: 'saveState', state: { nodes: newNodes, edges: newEdges, groups, viewMode: getPersistableViewMode(viewMode) } });
     },
     [postMessage, groups, viewMode]
   );
@@ -188,7 +272,7 @@ function App() {
   const handleGroupsChange = useCallback(
     (newGroups: GroupNode[]) => {
       setGroups(newGroups);
-      postMessage({ type: 'saveState', state: { nodes, edges, groups: newGroups, viewMode } });
+      postMessage({ type: 'saveState', state: { nodes, edges, groups: newGroups, viewMode: getPersistableViewMode(viewMode) } });
     },
     [postMessage, nodes, edges, viewMode]
   );
@@ -196,31 +280,56 @@ function App() {
   const handleModeChange = useCallback(
     (newMode: ViewMode) => {
       setViewMode(newMode);
-      postMessage({ type: 'saveState', state: { nodes, edges, groups, viewMode: newMode } });
+      // Don't persist '3d' mode - it's experimental and slow
+      postMessage({ type: 'saveState', state: { nodes, edges, groups, viewMode: getPersistableViewMode(newMode) } });
+      // Notify extension about mode change to update groups/edges
+      postMessage({ type: 'modeChange', mode: newMode });
     },
     [postMessage, nodes, edges, groups]
   );
 
   return (
     <div style={{ width: '100%', height: '100%' }}>
-      <PathfinderGraph
-        nodes={nodes}
-        edges={edges}
-        groups={groups}
-        highlightedNodeId={highlightedNodeId}
-        activeNodeId={activeNodeId}
-        searchResults={searchResults}
-        viewMode={viewMode}
-        allPlugins={allPlugins}
-        onNodeClick={handleNodeClick}
-        onNodeDelete={handleNodeDelete}
-        onClear={handleClear}
-        onStateChange={handleStateChange}
-        onGroupsChange={handleGroupsChange}
-        onSearchFiles={handleSearchFiles}
-        onOpenPluginIndex={handleOpenPluginIndex}
-        onModeChange={handleModeChange}
-      />
+      {viewMode === '3d' ? (
+        <PathfinderGraph3D
+          allPlugins={allPlugins}
+          fileNodes={nodes}
+          fileEdges={edges}
+          groups={groups}
+          activeNodeId={activeNodeId}
+          onPluginClick={handleOpenPluginIndex}
+          onPluginDoubleClick={handleOpenPluginIndex}
+          onFileClick={handleNodeClick}
+          onModeChange={handleModeChange}
+          onClear={handleClear}
+        />
+      ) : (
+        <PathfinderGraph
+          nodes={nodes}
+          edges={edges}
+          groups={groups}
+          highlightedNodeId={highlightedNodeId}
+          activeNodeId={activeNodeId}
+          searchResults={searchResults}
+          viewMode={viewMode}
+          allPlugins={allPlugins}
+          importAnalysis={importAnalysis}
+          analyzingImports={analyzingImports}
+          openImportAnalysisPopup={openImportAnalysisPopup}
+          loadingPlugins={loadingPlugins}
+          onNodeClick={handleNodeClick}
+          onNodeDelete={handleNodeDelete}
+          onClear={handleClear}
+          onStateChange={handleStateChange}
+          onGroupsChange={handleGroupsChange}
+          onSearchFiles={handleSearchFiles}
+          onOpenPluginIndex={handleOpenPluginIndex}
+          onModeChange={handleModeChange}
+          onAnalyzeImports={handleAnalyzeImports}
+          onToggleImportAnalysis={setOpenImportAnalysisPopup}
+          onOpenImportSource={handleOpenImportSource}
+        />
+      )}
     </div>
   );
 }
